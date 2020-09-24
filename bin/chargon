@@ -1,0 +1,433 @@
+#!/usr/bin/env bash
+
+##
+# chargon
+#
+# Symmetrically encrypt a file with ChaCha20 using Argon2 KDF
+#
+# encrypt: chargon e < secret.txt > secret.txt.enc
+# decrypt: chargon d < secret.txt.enc > secret.txt
+##
+
+expect_magic="#chargon"
+
+# dependencies
+cmd_ssl=libressl-openssl
+cmd_argon2=argon2
+
+# Default Argon2 Inputs
+hash_type="argon2i"
+iterations=3
+memory=4096
+parallelism=1
+version=13
+
+# More Secure Argon2 Inputs
+s_hash_type="argon2id"
+s_iterations=5
+s_memory=19531250
+s_parallelism=4
+
+# KDF Inputs
+passphrase=
+salt=
+
+# Key Material
+key=
+iv=
+hkey=
+
+# Payload
+found_magic=
+modeline=
+hmac=
+ciphertext=
+
+# Key sizes
+declare -A key_bytes
+key_bytes[key]=64
+key_bytes[iv]=16
+key_bytes[hkey]=256
+
+salt_size=64
+
+
+show_help()
+{
+    self=${0##*/}
+    cat << EOF
+NAME
+    $self - Symmetrically encrypt a file with ChaCha20 using Argon2 KDF
+
+SYNOPSIS
+    $self encrypt|enc|e [OPTION]
+    $self decrypt|dec|d [OPTION]
+
+DESCRIPTION
+    $self encrypts and decrypts files using the libressl implementation of the
+    ChaCha20 cipher. It derives a key, iv, and hmac key from a user supplied
+    passphrase using the Argon2 KDF. A random salt is generated with libressl.
+
+    Encryption output contains argon2 settings for use during decryption.
+
+    SHA512 HMAC is generated with libressl and included with the data. Failure
+    to verify it aborts decryption.
+
+    Passphrases can be supplied on the commandline, read from a file, or entered
+    interactively.
+
+    $self reads from stdin and writes to stdout.
+
+OPTIONS
+    -passfile FILE          read passphrase from first line of FILE
+    -pass PASS, -pw PASS    use PASS as passphrase
+    -config FILE            include a config file
+
+ARGON OPTIONS
+    See argon2(1) for more information. Only applicable when encrypting
+
+    -secure, -s use more secure preset options for argon2
+
+    -i          Use Argon2i (this is the default)
+    -d          Use Argon2d instead of Argon2i
+    -id         Use Argon2id instead of Argon2i
+    -t N        Sets the number of iterations to N (default = 3)
+    -k N        Sets the memory usage of N KiB (default 4096)
+    -p N        Sets parallelism to N threads (default 1)
+    -v (10|13)  Argon2 version (defaults to the most recent version, currently 13)
+
+ENCRYPTED FORMAT
+    line 1 : #chargon identifier
+    line 2 : argon2 mode line. similar to argon2 "encoded format"
+    line 3 : base64 encoded HMAC
+    line 4 : base64 encoded ciphertext
+
+USAGE
+    $ cat FILE | $self enc
+    $ $self enc < FILE
+        Encrypt a file, interactive prompt for passphrase
+
+    $ cat FILE | $self dec
+    $ $self dec < FILE
+        Decrypt a file, interactive prompt for passphrase
+
+
+SEE ALSO
+    argon2(1), openssl(1)
+
+EOF
+}
+
+
+##
+# UI / IO / Helpers
+##
+
+
+info()
+{
+    printf '%s\n' "$*" >&2
+}
+
+die()
+{
+    printf '%s\n' "$*" >&2
+    exit 1
+}
+
+empty_opt()
+{
+    die "ERROR: '-$1' requires a non-empty option argument."
+}
+
+dec2hex()
+{
+    printf '%s' $((16#${1}))
+}
+
+hex2dec()
+{
+    printf '%x' "$1"
+}
+
+prompt_pass()
+{
+    info "${1:-Enter} Passphrase:"
+    read -r -s user_pass </dev/tty
+    printf '%s' "$user_pass"
+}
+
+passphrase_encrypt()
+{
+    pass1=$(prompt_pass)
+    pass2=$(prompt_pass "Confirm")
+    if [[ "$pass1" == "$pass2" ]]; then
+        passphrase="$pass1"
+    else
+        die "Passphrases did not match"
+    fi
+}
+
+passphrase_decrypt()
+{
+    passphrase=$(prompt_pass)
+}
+
+parse_encrypted()
+{
+    read -r found_magic
+    read -r modeline
+    read -r hmac
+    ciphertext=$(cat)
+}
+
+##
+# Validation
+##
+
+# ensure key material exists before doing any crypto
+assert_key_material()
+{
+    [[ "$key" ]]  || die "No Key Derived"
+    [[ "$iv" ]]   || die "No IV Derived"
+    [[ "$hkey" ]] || die "No HKey Derived"
+}
+
+# ensure KDF inputs exist before doing any calculation
+assert_kdf_inputs()
+{
+    [[ "$passphrase" ]] || die "No Passphrase"
+    [[ "$salt" ]]       || die "No Salt"
+}
+
+# sanity check that we're decryption a chargon file
+assert_chargon()
+{
+    [[ "$found_magic" == "$expect_magic" ]] || die "Invalid File"
+}
+
+# verify found hmac against one calculated from stdin
+verify()
+{
+    [[ "$hmac" ]]              || die "No HMAC"
+    [[ "$hmac" == "$(hmac)" ]] || die "Invalid HMAC"
+}
+
+
+##
+# Crypto
+##
+
+# random salt for encryption
+init_salt()
+{
+    salt=$(libressl-openssl rand -hex "$salt_size")
+}
+
+# encrypt stdin with $key and $iv
+enc()
+{
+    assert_key_material
+    $cmd_ssl enc -chacha -K "$key" -iv "$iv" | base64 -w 0
+}
+
+# decrypt stdin with $key and $iv
+dec()
+{
+    assert_key_material
+    base64 -d | $cmd_ssl enc -d -chacha -K "$key" -iv "$iv"
+}
+
+# generate hmac from stdin with $hkey
+hmac()
+{
+    assert_key_material
+    $cmd_ssl dgst -sha512 -hmac "$hkey" | cut -d' ' -f2 | base64 -w 0
+}
+
+# run KDF. Argon2 inputs from cli for encryption or modeline in encrypted file
+derive_key()
+{
+    assert_kdf_inputs
+
+    case "$hash_type" in
+        argon2d)  hashflag="-d" ;;
+        argon2i)  hashflag="-i" ;;
+        argon2id) hashflag="-id" ;;
+        *) die "Invalid hash type $hash_type"
+    esac
+
+    sum=$(IFS=+; printf '%s' "$((${key_bytes[*]}))")
+    length=$(( sum / 2 ))
+
+    $cmd_argon2 "$salt" \
+        "$hashflag" \
+        -t "$iterations"  \
+        -k "$memory"  \
+        -p "$parallelism" \
+        -v "$version" \
+        -l "$length" \
+        -r \
+        <<< "$passphrase"
+}
+
+# parse a $key $iv and $hkey (key for hmac) from KDF hash
+parse_key()
+{
+    read -r -n "${key_bytes[key]}" key
+    read -r -n "${key_bytes[iv]}" iv
+    read -r -n "${key_bytes[hkey]}" hkey
+}
+
+# generate key from KDF and parse to component parts
+key_material()
+{
+    assert_kdf_inputs
+    parse_key <<< "$(derive_key)"
+    assert_key_material
+}
+
+
+##
+# Argon2
+##
+
+# store argon2 settings in encrypted file. Mimics argon2 encoded format
+modeline()
+{
+    printf '\44%s\44v=%s\44m=%s,t=%s,p=%s$%s' \
+        "$hash_type" \
+        "$(dec2hex "$version")" \
+        "$memory" \
+        "$iterations" \
+        "$parallelism" \
+        "$(base64 -w 0 <<< "$salt")"
+}
+
+# parse argon2 settings from modeline of encrypted file
+parse_modeline()
+{
+    [[ "$modeline" ]] || die "Modeline not found"
+    IFS='$' read -r _ hash_type enc_version enc_settings enc_salt enc_dk <<< "$modeline"
+    [[ "$enc_dk" ]] && die "!! KEY PRESENT IN MODELINE !!"
+
+    version="$(hex2dec "${enc_version:2}")"
+    salt="$(base64 -d <<< "$enc_salt")"
+
+    while IFS="=" read -r -d',' x opt; do
+        case "$x" in
+            m) memory="$opt" ;;
+            t) iterations="$opt" ;;
+            p) parallelism="$opt" ;;
+            *) die "Invalid Modeline Setting ($x) : $enc_settings"
+        esac
+    done <<< "$enc_settings,"
+}
+
+
+##
+# Commands
+##
+
+# encrypt stdin
+encrypt()
+{
+    [[ "$passphrase" ]] || passphrase_encrypt
+    init_salt
+    key_material
+    ciphertext=$(enc)
+    hmac=$(hmac <<< "$ciphertext")
+    printf '%s\n' "$expect_magic" "$(modeline)" "$hmac" "$ciphertext"
+}
+
+# decrypt stdin
+decrypt()
+{
+    parse_encrypted
+    assert_chargon
+    parse_modeline
+    [[ "$passphrase" ]] || passphrase_decrypt
+    key_material
+    verify <<< "$ciphertext"
+    dec <<< "$ciphertext"
+}
+
+
+##
+# parse options
+##
+
+cmd="$1"
+shift
+
+while :; do
+    case $1 in
+        -h|-\?|--help) show_help; exit ;;
+        -i)  hash_type="argon2i" ;;
+        -d)  hash_type="argon2d" ;;
+        -id) hash_type="argon2id" ;;
+        -t) if [[ "$2" ]]; then iterations=$2;  shift; else empty_opt "t"; fi ;;
+        -k) if [[ "$2" ]]; then memory=$2;      shift; else empty_opt "m"; fi ;;
+        -p) if [[ "$2" ]]; then parallelism=$2; shift; else empty_opt "p"; fi ;;
+        -v) if [[ "$2" ]]; then version="$2";   shift; else empty_opt "v"; fi ;;
+        -secure|-s)
+            hash_type=$s_hash_type
+            iterations=$s_iterations
+            memory=$s_memory
+            parallelism=$s_parallelism
+            ;;
+        -passfile)
+            if [[ "$2" ]]; then read -r passphrase < "$2"; shift;
+            else empty_opt "passfile"; fi
+            ;;
+        -pass|-pw)
+            if [[ "$2" ]]; then passphrase="$2"; shift;
+            else empty_opt "pass"; fi
+            ;;
+        -config)
+            if [[ "$2" ]]; then CHARGONRC="$2"; shift;
+            else empty_opt "config"; fi
+            ;;
+        --) shift; break; # End of options
+            ;;
+        -?*) printf 'WARN: Unknown option (ignored): %s\n' "$1" >&2;
+            ;;
+        *)  break # Default case: No more options, so break out of the loop.
+    esac
+
+    shift
+done
+
+
+##
+# include rc file
+##
+
+[[ "$CHARGONRC" ]] || CHARGONRC="${XDG_CONFIG_HOME:-$HOME/.config}/chargon/chargonrc"
+# shellcheck source=/dev/null
+[[ -e  "$CHARGONRC" ]] && source "$CHARGONRC"
+
+
+##
+# check dependencies
+##
+
+if ! command -v "$cmd_ssl" >/dev/null; then
+    die "libressl-openssl is not installed"
+fi
+
+if ! command -v "$cmd_argon2" >/dev/null; then
+    die "argon2 is not installed"
+fi
+
+
+##
+# main
+##
+
+case "$cmd" in
+    h|-h|help|-help|--help|-\?|\?) show_help; exit; ;;
+    e|en|enc|encrypt ) encrypt ;;
+    d|de|dec|decrypt ) decrypt ;;
+    *) die "Invalid Command! Encrypt or decrpyt? "
+esac
